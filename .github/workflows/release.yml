@@ -1,0 +1,43 @@
+name: Release
+
+# Builds on every push to main. When VERSION names a release that doesn't
+# exist yet, publishes it with the plugin zip.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Check version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = 'v' + (Get-Content VERSION -Raw).Trim()
+          gh release view $tag *> $null
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "new=$($LASTEXITCODE -ne 0)" >> $env:GITHUB_OUTPUT
+          $global:LASTEXITCODE = 0
+
+      - name: Publish
+        if: steps.version.outputs.new == 'True'
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          Copy-Item README.md, LICENSE build/OrbitView/
+          Compress-Archive build/OrbitView "OrbitView-$tag.zip"
+          gh release create $tag "OrbitView-$tag.zip" --title "OrbitView $tag" --generate-notes --target $env:GITHUB_SHA

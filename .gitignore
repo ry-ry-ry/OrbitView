@@ -1,0 +1,5 @@
+build/
+SDK/Delphi/
+SDK/CHeaders/Wrappers/
+SDK/Libraries/Lin/
+SDK/Libraries/Mac/
