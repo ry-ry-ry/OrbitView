@@ -226,7 +226,7 @@ static XPLMDataRef dr_lx, dr_ly, dr_lz, dr_psi;
 static XPLMDataRef dr_isExternal, dr_vr;
 static XPLMDataRef dr_headX, dr_headY, dr_headZ, dr_headPsi, dr_headThe;
 static XPLMDataRef dr_peX, dr_peY, dr_peZ, dr_sizeX, dr_sizeZ;
-static XPLMDataRef dr_axisValues, dr_axisAssign, dr_axisAvail;
+static XPLMDataRef dr_axisValues, dr_axisAssign;
 static XPLMDataRef dr_gloadCam;
 static XPLMDataRef dr_ax, dr_ay, dr_az, dr_vy, dr_the, dr_phi, dr_gs, dr_onGround, dr_paused;
 static int g_savedGloadCam = -1;     // user's G-loaded camera setting while we hold it off
@@ -248,7 +248,6 @@ static bool  g_rDrag = false;
 static POINT g_lastPt;
 
 static int g_stickX = -1, g_stickY = -1; // resolved raw axis indices
-static int g_stickFnX = -1, g_stickFnY = -1; // their X-Plane axis functions (41/42), -1 = unassigned
 static bool g_stickArmed = false;    // stick seen centred since its hardware appeared
 
 static bool g_enabled = true;
@@ -544,31 +543,27 @@ static void ProcessInput(float dt) {
 
     // Look / orbit. An axis stays assigned after its pad is unplugged and then
     // reads 0, i.e. full deflection, which spun the camera. So the stick is
-    // read only while X-Plane reports hardware for it, and only once it has
-    // been seen centred since then.
+    // used only once it has been seen centred, and dropped again when every
+    // assigned axis reads exactly 0 (no device; a round-gated stick can't
+    // reach that corner). sim/joystick/joy_mapped_axis_avail can't be used:
+    // it reads 0 even with the pad connected.
     float sx = 0.f, sy = 0.f;
     if (g_stickX >= 0 || g_stickY >= 0) {
-        bool present = true;
-        if (dr_axisAvail) {
-            int avail[81] = {};
-            XPLMGetDatavi(dr_axisAvail, avail, 0, 81);
-            auto ok = [&](int fn) { return fn < 0 || fn >= 81 || avail[fn] != 0; };
-            present = ok(g_stickFnX) && ok(g_stickFnY);
-        }
-        if (!present) {
+        float values[500];
+        XPLMGetDatavf(dr_axisValues, values, 0, 500);
+        bool noDevice = (g_stickX < 0 || values[g_stickX] == 0.f) &&
+                        (g_stickY < 0 || values[g_stickY] == 0.f);
+        sx = StickDeflection(g_stickX, values);
+        sy = -StickDeflection(g_stickY, values);   // stick up reads low
+        if (g_cfg.invert_stick_y) sy = -sy;
+        if (noDevice) {
+            if (g_stickArmed) Log("stick lost");
             g_stickArmed = false;
-        } else {
-            float values[500];
-            XPLMGetDatavf(dr_axisValues, values, 0, 500);
-            sx = StickDeflection(g_stickX, values);
-            sy = -StickDeflection(g_stickY, values);   // stick up reads low
-            if (g_cfg.invert_stick_y) sy = -sy;
-            if (!g_stickArmed && sx == 0.f && sy == 0.f) {
-                g_stickArmed = true;
-                Log("stick armed");
-            }
-            if (!g_stickArmed) sx = sy = 0.f;
+        } else if (!g_stickArmed && sx == 0.f && sy == 0.f) {
+            g_stickArmed = true;
+            Log("stick armed");
         }
+        if (!g_stickArmed) sx = sy = 0.f;
     }
     float my = (float)g_mouseDy * (g_cfg.invert_mouse_y ? 1.f : -1.f);
     float dyaw = (float)g_mouseDx * g_cfg.mouse_sensitivity + sx * g_cfg.stick_rate * dt;
@@ -1257,8 +1252,6 @@ static void ResolveStickAxes() {
         if (g_cfg.stick_x_axis < 0 && assign[i] == 41) g_stickX = i;
         if (g_cfg.stick_y_axis < 0 && assign[i] == 42) g_stickY = i;
     }
-    g_stickFnX = g_stickX >= 0 && g_stickX < 500 && assign[g_stickX] > 0 ? assign[g_stickX] : -1;
-    g_stickFnY = g_stickY >= 0 && g_stickY < 500 && assign[g_stickY] > 0 ? assign[g_stickY] : -1;
 }
 
 static float FlightLoop(float, float, int, void*) {
@@ -1360,9 +1353,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     dr_sizeX = XPLMFindDataRef("sim/aircraft/view/acf_size_x");
     dr_sizeZ = XPLMFindDataRef("sim/aircraft/view/acf_size_z");
     dr_axisValues = XPLMFindDataRef("sim/joystick/joystick_axis_values");
-    dr_axisAssign = XPLMFindDataRef("sim/joystick/joystick_axis_assignments");
-    dr_axisAvail = XPLMFindDataRef("sim/joystick/joy_mapped_axis_avail");
-    dr_gloadCam = XPLMFindDataRef("sim/graphics/view/gloaded_internal_cam");
+    dr_axisAssign = XPLMFindDataRef("sim/joystick/joystick_axis_assignments");    dr_gloadCam = XPLMFindDataRef("sim/graphics/view/gloaded_internal_cam");
     dr_ax = XPLMFindDataRef("sim/flightmodel/position/local_ax");
     dr_ay = XPLMFindDataRef("sim/flightmodel/position/local_ay");
     dr_az = XPLMFindDataRef("sim/flightmodel/position/local_az");

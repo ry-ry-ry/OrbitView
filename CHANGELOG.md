@@ -11,6 +11,16 @@ All notable changes to OrbitView are documented here. The format follows
 To release, add a section here, set `VERSION` to the same number and push to `main`.
 The release workflow publishes that section as the release notes.
 
+## [1.0.2] - 2026-11-14
+
+### Fixed
+
+- The right stick only nudged the camera a degree or two per push. 1.0.1
+  relied on an X-Plane dataref that turned out to report the pad as missing
+  even when it's connected. OrbitView now starts using the stick once it has
+  been seen centred, and stops if every assigned axis drops to the reading
+  X-Plane gives for a missing device.
+
 ## [1.0.1] - 2026-11-14
 
 ### Fixed
@@ -24,5 +34,6 @@ The release workflow publishes that section as the release notes.
 
 Initial release.
 
+[1.0.2]: ../../compare/v1.0.1...v1.0.2
 [1.0.1]: ../../compare/v1.0.0...v1.0.1
 [1.0.0]: ../../releases/tag/v1.0.0
