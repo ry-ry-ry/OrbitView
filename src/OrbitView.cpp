@@ -7,6 +7,7 @@
 //   End                toggle cockpit <-> exterior
 //   Right-drag         look / orbit
 //   Mouse wheel, = / - zoom (in the cockpit this is X-Plane's own zoom)
+//   Right-drag + wheel cockpit: OrbitView's own wider, finer zoom (per view)
 //   Shift+W/S          move forward / back (exterior: closer / farther)
 //   Shift+A/D          move left / right
 //   Shift+E/Q          move up / down
@@ -14,6 +15,11 @@
 //   Ctrl+Shift+Space   add the current camera as a new view
 //   Right stick        look / orbit (axes auto-detected from X-Plane's
 //                      "View left/right" and "View up/down" assignments)
+//   F12                cinematic camera: slow drifting shots of different
+//                      parts of the aircraft, with the occasional flyby
+//                      (A / D skip a shot, F12 or End leave it)
+//   Right-drag + middle click  raise / lower binoculars (wheel = magnification,
+//                      2-50x, separate from the normal zoom; compass at the bottom)
 // Views are managed in the Plugins > OrbitView > Views window and saved to
 // presets\<aircraft>.acf.txt. Every action is also an orbitview/* command.
 // Camera effects (G sway, turbulence, ground) are set on the Preferences page
@@ -25,11 +31,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <GL/gl.h>
 
 #include "XPLMCamera.h"
 #include "XPLMDataAccess.h"
@@ -68,6 +76,11 @@ struct Config {
     float fx_gforce = 1.0f;          // effect strengths, 1 = default, 0..2
     float fx_turbulence = 1.0f;
     float fx_ground = 1.0f;
+    float cinematic_shot_time = 7.0f; // seconds per cinematic shot (varies +-15%)
+    float cinematic_fade = 0.4f;      // dip to black between shots (s), 0 = hard cut
+    int   cinematic_flyby = 1;        // include flybys when the aircraft is moving
+    float binocular_zoom = 6.0f;      // binocular magnification when first raised (2..50)
+    float cinematic_distance = 1.0f;  // drift-shot distance multiplier
 };
 
 static Config g_cfg;
@@ -116,6 +129,11 @@ static void LoadConfig() {
         else if (k == "fx_gforce")          g_cfg.fx_gforce = v;
         else if (k == "fx_turbulence")      g_cfg.fx_turbulence = v;
         else if (k == "fx_ground")          g_cfg.fx_ground = v;
+        else if (k == "cinematic_shot_time") g_cfg.cinematic_shot_time = v;
+        else if (k == "cinematic_fade")     g_cfg.cinematic_fade = v;
+        else if (k == "cinematic_flyby")    g_cfg.cinematic_flyby = (int)v;
+        else if (k == "cinematic_distance") g_cfg.cinematic_distance = v;
+        else if (k == "binocular_zoom")     g_cfg.binocular_zoom = v;
         else Log("unknown config key '%s'", key);
     }
     fclose(f);
@@ -229,6 +247,7 @@ static XPLMDataRef dr_peX, dr_peY, dr_peZ, dr_sizeX, dr_sizeZ;
 static XPLMDataRef dr_axisValues, dr_axisAssign;
 static XPLMDataRef dr_gloadCam;
 static XPLMDataRef dr_ax, dr_ay, dr_az, dr_vy, dr_the, dr_phi, dr_gs, dr_onGround, dr_paused;
+static XPLMDataRef dr_vx, dr_vz, dr_fov, dr_magPsi;
 static int g_savedGloadCam = -1;     // user's G-loaded camera setting while we hold it off
 
 static XPLMProbeRef g_probe = nullptr;
@@ -253,6 +272,19 @@ static bool g_stickArmed = false;    // stick seen centred since its hardware ap
 static bool g_enabled = true;
 static bool g_running = false;       // enabled, views built, not in VR
 static bool g_inControl = false;     // we own the camera (exterior views)
+static bool g_cine = false;          // cinematic camera running (always in EXTERIOR mode)
+
+// Binoculars: magnify the current view; the wheel sets the magnification and
+// looking around slows down to match. Zoom and (outside) look offsets glide.
+static bool  g_bino = false;
+static bool  g_binoToggleReq = false;  // set by the window procedure, handled in the flight loop
+static float g_binoZoom = 0.f;         // target magnification, 0 = take it from config.ini
+static float g_binoZoomCur = 1.f;      // rendered magnification
+static float g_binoYaw = 0.f, g_binoPitch = 0.f;       // exterior look offset, target
+static float g_binoYawCur = 0.f, g_binoPitchCur = 0.f; // exterior look offset, rendered
+static float g_savedFov = -1.f;        // user's field of view while cockpit binoculars narrow it
+static const float kBinoMin = 2.f, kBinoMax = 50.f;
+static float g_viewHdg = 0.f;          // true heading the rendered view looks along (for the compass)
 static double g_lastViewCmdTime = -10.0;
 static double g_initAt = -1.0;       // time at which to (re)build views for a new aircraft
 
@@ -290,6 +322,74 @@ static void ShowToastText(const char* text) {
     XPLMSetWindowGeometry(g_toast, cx - 130, t - 60, cx + 130, t - 90);
     XPLMSetWindowIsVisible(g_toast, 1);
     g_toastUntil = Now() + 1.5;
+}
+
+// Binocular compass: a heading tape along the bottom of the screen showing
+// the magnetic heading the view looks along, plus the magnification.
+static XPLMWindowID g_compass = nullptr;
+
+static float g_viewHdgForCompass() {   // magnetic
+    return g_viewHdg + (dr_magPsi ? XPLMGetDataf(dr_magPsi) - XPLMGetDataf(dr_psi) : 0.f);
+}
+
+static void DrawCompassText(int x, int y, const char* s, float* color) {
+    int w = (int)XPLMMeasureString(xplmFont_Proportional, s, (int)strlen(s));
+    XPLMDrawString(color, x - w / 2, y, (char*)s, nullptr, xplmFont_Proportional);
+}
+
+static void DrawCompass(XPLMWindowID w, void*) {
+    int l, t, r, b;
+    XPLMGetWindowGeometry(w, &l, &t, &r, &b);
+    XPLMDrawTranslucentDarkBox(l, t, r, b);
+    float hdg = fmodf(g_viewHdgForCompass() + 720.f, 360.f);
+    const float half = 30.f;                       // degrees each side of centre
+    float ppd = (r - l - 24) / (2.f * half);
+    int cx = (l + r) / 2, tickTop = b + 30;
+
+    XPLMSetGraphicsState(0, 0, 0, 0, 1, 0, 0);
+    glColor4f(1.f, 1.f, 1.f, 0.9f);
+    glBegin(GL_LINES);
+    for (int d = (int)floorf((hdg - half) / 5.f) * 5; d <= hdg + half; d += 5) {
+        float x = cx + (d - hdg) * ppd;
+        if (x < l + 8 || x > r - 8) continue;
+        float len = ((d % 10) + 10) % 10 == 0 ? 8.f : 4.f;
+        glVertex2f(x, (float)tickTop);
+        glVertex2f(x, tickTop - len);
+    }
+    glEnd();
+    glColor4f(1.f, 0.85f, 0.2f, 1.f);              // lubber line
+    glBegin(GL_LINES);
+    glVertex2f((float)cx, (float)tickTop + 4.f);
+    glVertex2f((float)cx, (float)tickTop - 12.f);
+    glEnd();
+
+    float white[3] = {1, 1, 1}, amber[3] = {1.f, 0.85f, 0.2f};
+    for (int d = (int)floorf((hdg - half) / 30.f) * 30; d <= hdg + half; d += 30) {
+        float x = cx + (d - hdg) * ppd;
+        if (x < l + 14 || x > r - 14) continue;
+        int n = ((d % 360) + 360) % 360;
+        char lab[8];
+        if (n % 90 == 0) snprintf(lab, sizeof(lab), "%c", "NESW"[n / 90]);
+        else snprintf(lab, sizeof(lab), "%03d", n);
+        DrawCompassText((int)x, b + 6, lab, white);
+    }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%03d", ((int)lroundf(hdg) + 359) % 360 + 1);
+    DrawCompassText(cx, t - 14, buf, amber);
+    snprintf(buf, sizeof(buf), "%.1fx", g_binoZoomCur);
+    XPLMDrawString(white, r - 8 - (int)XPLMMeasureString(xplmFont_Proportional, buf, (int)strlen(buf)), t - 14,
+                   buf, nullptr, xplmFont_Proportional);
+}
+
+static void ShowCompass(bool show) {
+    if (!g_compass || (XPLMGetWindowIsVisible(g_compass) != 0) == show) return;
+    if (show) {
+        int l, t, r, b;
+        XPLMGetScreenBoundsGlobal(&l, &t, &r, &b);
+        int cx = (l + r) / 2;
+        XPLMSetWindowGeometry(g_compass, cx - 180, b + 100, cx + 180, b + 50);
+    }
+    XPLMSetWindowIsVisible(g_compass, show);
 }
 
 static void ShowToast() {
@@ -419,8 +519,11 @@ static void UpdateCameraOwnership() {
     }
 }
 
+static void EndBinoculars();
+
 // Jump (no glide) to the current category's selected view.
 static void EnterMode(int m) {
+    EndBinoculars();
     g_mode = m;
     Current().live = Current().saved;
     g_cur = Current().live;
@@ -435,6 +538,8 @@ static void SetMode(int m) {
 }
 
 static void SelectView(int i) {
+    g_bino = false;                  // lower the binoculars; the zoom glides out
+    g_binoYaw = g_binoPitch = 0.f;
     g_idx[g_mode] = i;
     Current().live = Current().saved;
     g_transition = true;
@@ -517,7 +622,93 @@ static void HoldGloadCamOff(bool hold) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Binoculars
+
+static void ShowBinoZoom() {
+    char text[64];
+    snprintf(text, sizeof(text), "Binoculars %.1fx", g_binoZoom);
+    ShowToastText(text);
+}
+
+// The field of view is a saved X-Plane setting. While OrbitView has changed
+// it, fov_restore.txt holds the user's own value, so that if X-Plane quits
+// (it may save its prefs before plugins are stopped) or crashes, the value is
+// put back on the next start.
+static std::string FovRestorePath() { return g_pluginDir + "fov_restore.txt"; }
+
+static void RestoreFov() {
+    if (g_savedFov < 0.f) return;
+    if (dr_fov) XPLMSetDataf(dr_fov, g_savedFov);
+    g_savedFov = -1.f;
+    DeleteFileA(FovRestorePath().c_str());
+}
+
+static void RecoverFovAfterRestart() {
+    FILE* f = nullptr;
+    if (fopen_s(&f, FovRestorePath().c_str(), "r") != 0 || !f) return;
+    float v = 0.f;
+    if (fscanf_s(f, "%f", &v) == 1 && v >= 20.f && v <= 160.f && dr_fov) {
+        XPLMSetDataf(dr_fov, v);
+        Log("restored field of view to %.1f deg", v);
+    }
+    fclose(f);
+    DeleteFileA(FovRestorePath().c_str());
+}
+
+// Drops the binoculars at once (view category changes, cinematic, shutdown).
+static void EndBinoculars() {
+    g_bino = false;
+    g_binoZoomCur = 1.f;
+    g_binoYaw = g_binoPitch = g_binoYawCur = g_binoPitchCur = 0.f;
+    RestoreFov();
+}
+
+static void ToggleBinoculars() {
+    g_bino = !g_bino;
+    if (!g_bino) {   // lowered: zoom and look offset glide back
+        g_binoYaw = g_binoPitch = 0.f;
+        ShowToastText("Binoculars off");
+        return;
+    }
+    if (g_binoZoom <= 0.f) g_binoZoom = Clamp(g_cfg.binocular_zoom, kBinoMin, kBinoMax);
+    ShowBinoZoom();
+}
+
+static void SmoothBinoculars(float dt) {
+    float target = g_bino ? g_binoZoom : 1.f;
+    float a = 1.f - expf(-6.f * dt);   // zoom glides in log space, so every step feels the same
+    g_binoZoomCur = expf(logf(g_binoZoomCur) + (logf(target) - logf(g_binoZoomCur)) * a);
+    if (!g_bino && g_binoZoomCur < 1.002f) g_binoZoomCur = 1.f;
+    float b = g_cfg.input_smoothing > 0.f ? 1.f - expf(-g_cfg.input_smoothing * dt) : 1.f;
+    g_binoYawCur = Wrap180(g_binoYawCur + Wrap180(g_binoYaw - g_binoYawCur) * b);
+    g_binoPitchCur += (g_binoPitch - g_binoPitchCur) * b;
+}
+
+// Cockpit zoom (right-drag + wheel, per view) and binoculars both work by
+// changing X-Plane's field of view; the user's own value is put back as soon
+// as the combined zoom is back to 1x.
+static void ApplyCockpitFov() {
+    if (!dr_fov) return;
+    float zoom = g_cur.zoom * g_binoZoomCur;
+    if (fabsf(zoom - 1.f) < 0.001f) { RestoreFov(); return; }
+    if (g_savedFov < 0.f) {
+        g_savedFov = XPLMGetDataf(dr_fov);
+        FILE* f = nullptr;
+        if (fopen_s(&f, FovRestorePath().c_str(), "w") == 0 && f) {
+            fprintf(f, "%f\n", g_savedFov);
+            fclose(f);
+        }
+    }
+    float half = (float)atan(tan(g_savedFov * 0.5 * D2R) / zoom) * (float)R2D;
+    XPLMSetDataf(dr_fov, fminf(2.f * half, 150.f));
+}
+
+static void StopCinematic(bool restoreView);
+
 static void StopRunning() {
+    EndBinoculars();
+    StopCinematic(false);
     g_running = false;
     UpdateCameraOwnership();
     ClearHeldInput();
@@ -570,9 +761,17 @@ static void ProcessInput(float dt) {
     float dpitch = my * g_cfg.mouse_sensitivity + sy * g_cfg.stick_rate * dt;
     g_mouseDx = g_mouseDy = 0;
 
+    // Binoculars: looking around slows with the magnification. Outside, the
+    // camera stays put and only the look direction turns (no orbit).
+    if (g_binoZoomCur > 1.f) { dyaw /= g_binoZoomCur; dpitch /= g_binoZoomCur; }
     float pitchMin = -89.f, pitchMax = g_mode == COCKPIT ? 89.f : 60.f;
-    t.yaw = Wrap180(t.yaw + dyaw);
-    t.pitch = Clamp(t.pitch + dpitch, pitchMin, pitchMax);
+    if (g_bino && g_mode == EXTERIOR) {
+        g_binoYaw = Wrap180(g_binoYaw + dyaw);
+        g_binoPitch = Clamp(g_binoPitch + dpitch, -80.f, 80.f);
+    } else {
+        t.yaw = Wrap180(t.yaw + dyaw);
+        t.pitch = Clamp(t.pitch + dpitch, pitchMin, pitchMax);
+    }
 
     // Translation. Keys stay held while Windows says they're down, so missed
     // or auto-repeat up/down events can't make movement stutter.
@@ -602,9 +801,29 @@ static void ProcessInput(float dt) {
 
     // Exterior zoom: held commands and the mouse wheel. (Cockpit zoom is
     // X-Plane's own.)
+    // With binoculars up, the wheel (and outside, = / -) sets their own
+    // magnification instead, about 1.25x per notch.
+    if (g_bino) {
+        float zb = g_zoomCmd * dt * 1.2f + (float)g_wheel * 0.22f;
+        g_wheel = 0;
+        if (zb != 0.f) {
+            g_binoZoom = Clamp(g_binoZoom * expf(zb), kBinoMin, kBinoMax);
+            ShowBinoZoom();
+        }
+        return;
+    }
     float z = g_zoomCmd * dt * 1.2f + (float)g_wheel * g_cfg.wheel_step;
     g_wheel = 0;
     if (z != 0.f && g_mode == EXTERIOR) t.dist = Clamp(t.dist * expf(-z), 3.f, 3000.f);
+    // Cockpit: the wheel only gets here while right-dragging (the plain wheel
+    // stays X-Plane's, so it can turn knobs). Finer steps, and well past
+    // X-Plane's own zoom-out limit.
+    if (z != 0.f && g_mode == COCKPIT) {
+        t.zoom = Clamp(t.zoom * expf(z * 0.67f), 0.4f, 3.f);
+        char text[32];
+        snprintf(text, sizeof(text), "Zoom %.2fx", t.zoom);
+        ShowToastText(text);
+    }
 }
 
 static void Smooth(float dt) {
@@ -625,6 +844,7 @@ static void Smooth(float dt) {
 
     float b = g_cfg.heading_follow > 0.f ? 1.f - expf(-g_cfg.heading_follow * dt) : 1.f;
     g_hdgSmooth = Wrap180(g_hdgSmooth + Wrap180(XPLMGetDataf(dr_psi) - g_hdgSmooth) * b);
+    SmoothBinoculars(dt);
 }
 
 // ---------------------------------------------------------------------------
@@ -712,8 +932,214 @@ static void UpdateEffects(float dt) {
     g_fxExtYaw = g_cfg.effects_exterior ? (float)(20.0 * g_fxJolt.x.x) : 0.f;
 }
 
+// ---------------------------------------------------------------------------
+// Cinematic camera: a shuffled run of exterior shots of different parts of the
+// aircraft, each drifting slowly for a few seconds, with a dip to black between
+// them. Now and then, when the aircraft is moving, a flyby: the camera waits
+// beside the flight path ahead and tracks the aircraft as it passes.
+
+// Pivot in body axes (x right, y up, z aft) as fractions of the half-span (x),
+// the aircraft radius (y) and the half-length (z); eye = pivot on the eye point.
+// The camera drifts from (yaw0, pitch0, dist0) to (yaw1, pitch1, dist1) over
+// the shot: yaw relative to heading (0 = behind, 90 = left side, 180 = in
+// front), pitch absolute (negative = looking down), dist in aircraft radii.
+// Each shot is randomly mirrored left/right.
+struct Shot {
+    float px, py, pz;
+    int   eye;
+    float yaw0, yaw1, pitch0, pitch1, dist0, dist1;
+};
+static const Shot kShots[] = {
+    // Close-ups aim part-way between the feature and the middle, so the rest
+    // of the aircraft stays in frame.
+    {0.f,    0.f,  -0.6f,  0,  150.f,  165.f,  -4.f,  -7.f, 1.00f, 0.85f},  // nose, front quarter, pushing in
+    {0.f,    0.f,   0.f,   1, -155.f, -140.f, -14.f,  -9.f, 0.75f, 0.70f},  // flight deck windows
+    {-0.25f, -0.05f, -0.1f, 0, 125.f,  142.f,   2.f,  -1.f, 0.80f, 0.70f},  // engine / inner wing from ahead
+    {-0.4f,  0.f,   0.05f, 0,   30.f,   50.f, -22.f, -16.f, 0.75f, 0.80f},  // over the wing
+    {0.6f,   0.f,   0.1f,  0,  -35.f,  -15.f,  -4.f,  -1.f, 0.60f, 0.70f},  // wingtip
+    {0.f,    0.15f, 0.6f,  0,   35.f,   15.f,  -8.f, -14.f, 0.70f, 0.75f},  // tail
+    {0.f,   -0.1f, -0.1f,  0, -115.f,  -95.f,  14.f,  10.f, 0.95f, 0.90f},  // belly and gear from below (airborne only)
+    {0.f,    0.f,   0.f,   0,   82.f,   98.f,  -2.f,  -3.f, 1.70f, 1.60f},  // side profile dolly
+    {0.f,    0.f,   0.f,   0,   12.f,   -8.f, -26.f, -18.f, 2.00f, 2.40f},  // high rear, pulling back
+    {0.f,    0.f,   0.f,   0,  172.f,  158.f,   7.f,   3.f, 1.90f, 1.60f},  // low front, looking up
+    {0.f,    0.05f, -0.3f, 0,   10.f,   16.f, -11.f,  -9.f, 1.35f, 1.25f},  // along the fuselage from the tail
+};
+static const int kShotCount = (int)(sizeof(kShots) / sizeof(kShots[0]));
+
+static int    g_cineReturn = EXTERIOR; // category to go back to afterwards
+static int    g_cineShot = 0;          // index into kShots, -1 = flyby
+static float  g_cineSide = 1.f;        // +1 / -1: shot mirrored left/right
+static double g_cineT = 0, g_cineLen = 7; // time into the shot (paused time excluded) and its length
+static float  g_cineHdg = 0.f;         // smoothed heading the drift shots are framed from
+static bool   g_cineGround = false;    // aircraft was on the ground when the shot started
+static int    g_cineBag[kShotCount], g_cineBagPos = kShotCount, g_cineSinceFlyby = 0;
+static double g_flyLat, g_flyLon, g_flyAlt; // flyby camera; world coords so a local-origin shift can't move it
+static float  g_fade = 0.f;            // black overlay opacity, 0..1
+
+static float Rand01() {
+    static uint32_t s = 0;
+    if (!s) s = (uint32_t)GetTickCount64() | 1u;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return (s >> 8) * (1.f / 16777216.f);
+}
+
+// Half-span, half-length and a radius used to scale distances. The radius has
+// a floor so close-ups of light aircraft don't end up a couple of metres away.
+static void AircraftSize(float* S, float* L, float* R) {
+    *S = XPLMGetDataf(dr_sizeX);
+    *L = XPLMGetDataf(dr_sizeZ);
+    if (*S <= 0.f) *S = 10.f;
+    if (*L <= 0.f) *L = 10.f;
+    *R = Clamp(fmaxf(*S, *L), 12.f, 45.f);
+}
+
+static bool FlybyPossible() { return XPLMGetDataf(dr_gs) > 25.f; }
+
+// Places the camera beside the point the aircraft will reach in a few
+// seconds, offset sideways (more at higher speed, so it doesn't whip past),
+// usually a little below so it looks up as the aircraft goes over.
+static void StartFlyby() {
+    const double lead = 4.5;           // seconds until the aircraft is abeam
+    double vx = XPLMGetDataf(dr_vx), vy = XPLMGetDataf(dr_vy), vz = XPLMGetDataf(dr_vz);
+    double hs = fmax(sqrt(vx * vx + vz * vz), 1.0);
+    float S, L, R;
+    AircraftSize(&S, &L, &R);
+    double off = Clamp(fmaxf(1.4f * S, 0.6f * (float)hs), 15.f, 150.f) * (Rand01() < 0.5f ? -1.0 : 1.0);
+    double up = Rand01() < 0.65f ? -0.25 * fabs(off) : 0.15 * fabs(off);
+    V3 acf = {XPLMGetDatad(dr_lx), XPLMGetDatad(dr_ly), XPLMGetDatad(dr_lz)};
+    V3 pos = acf + V3{vx, vy, vz} * lead + V3{-vz / hs, 0, vx / hs} * off + V3{0, up, 0};
+    XPLMProbeInfo_t info = {sizeof(info)};
+    if (XPLMProbeTerrainXYZ(g_probe, (float)pos.x, (float)pos.y, (float)pos.z, &info) == xplm_ProbeHitTerrain &&
+        pos.y < info.locationY + 2.0)
+        pos.y = info.locationY + 2.0;
+    XPLMLocalToWorld(pos.x, pos.y, pos.z, &g_flyLat, &g_flyLon, &g_flyAlt);
+    g_cineShot = -1;
+    g_cineSinceFlyby = 0;
+    g_cineLen = lead + 4.5;
+}
+
+static void StartShot(bool allowFlyby) {
+    g_cineT = 0;
+    g_cineHdg = XPLMGetDataf(dr_psi);
+    if (allowFlyby && g_cfg.cinematic_flyby && FlybyPossible() &&
+        (g_cineSinceFlyby >= 5 || (g_cineSinceFlyby >= 3 && Rand01() < 0.5f))) {
+        StartFlyby();
+        return;
+    }
+    ++g_cineSinceFlyby;
+    // On the ground, shots from below would put the camera in the grass.
+    g_cineGround = XPLMGetDatai(dr_onGround) != 0;
+    for (int tries = 0; tries <= kShotCount; ++tries) {
+        if (g_cineBagPos >= kShotCount) {   // reshuffle, never repeating the last shot straight away
+            int last = g_cineShot;
+            for (int i = 0; i < kShotCount; ++i) g_cineBag[i] = i;
+            for (int i = kShotCount - 1; i > 0; --i) {
+                int j = (int)(Rand01() * (i + 1));
+                int tmp = g_cineBag[i]; g_cineBag[i] = g_cineBag[j]; g_cineBag[j] = tmp;
+            }
+            if (g_cineBag[0] == last) { g_cineBag[0] = g_cineBag[1]; g_cineBag[1] = last; }
+            g_cineBagPos = 0;
+        }
+        g_cineShot = g_cineBag[g_cineBagPos++];
+        if (!g_cineGround || kShots[g_cineShot].pitch0 < 10.f) break;
+    }
+    g_cineSide = Rand01() < 0.5f ? -1.f : 1.f;
+    g_cineLen = fmaxf(g_cfg.cinematic_shot_time, 2.f) * (0.85f + 0.3f * Rand01());
+}
+
+static void StartCinematic() {
+    if (g_cine) return;
+    g_cineReturn = g_mode;
+    EnterMode(EXTERIOR);
+    ApplyViewType();
+    g_cine = true;
+    g_cineBagPos = kShotCount;
+    g_cineSinceFlyby = 0;
+    StartShot(false);
+    ShowToastText("Cinematic camera");
+}
+
+static void StopCinematic(bool restoreView) {
+    if (!g_cine) return;
+    g_cine = false;
+    g_fade = 0.f;
+    g_mouseDx = g_mouseDy = g_wheel = 0;
+    g_hdgSmooth = XPLMGetDataf(dr_psi);   // Smooth() didn't run meanwhile
+    if (restoreView) SetMode(g_cineReturn);
+}
+
+static void CinematicCamera(XPLMCameraPosition_t* out, float dt) {
+    g_mouseDx = g_mouseDy = g_wheel = 0;   // no manual orbit while the director has the camera
+    if (!XPLMGetDatai(dr_paused)) g_cineT += dt;
+    if (g_cineT >= g_cineLen) StartShot(true);
+
+    float fade = g_cfg.cinematic_fade;
+    g_fade = fade > 0.f ? Clamp(1.f - (float)fmin(g_cineT, g_cineLen - g_cineT) / fade, 0.f, 1.f) : 0.f;
+
+    float S, L, R;
+    AircraftSize(&S, &L, &R);
+    V3 acf = {XPLMGetDatad(dr_lx), XPLMGetDatad(dr_ly), XPLMGetDatad(dr_lz)};
+    V3 pos, look;
+    float zoom = 1.f, shakeYaw = 0.f, shakePitch = 0.f;
+    if (g_cineShot < 0) {
+        double x, y, z;
+        XPLMWorldToLocal(g_flyLat, g_flyLon, g_flyAlt, &x, &y, &z);
+        pos = {x, y, z};
+        look = acf;
+        V3 d = acf - pos;
+        double r = sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        if (r > 10000.0) g_cineT = g_cineLen;   // teleported or turned away: next shot
+        zoom = Clamp((float)r / (3.f * R), 1.f, 4.f); // keep it framed while it's far off
+    } else {
+        const Shot& s = kShots[g_cineShot];
+        float k = (float)Clamp((float)(g_cineT / g_cineLen), 0.f, 1.f);
+        float b = g_cfg.heading_follow > 0.f ? 1.f - expf(-g_cfg.heading_follow * dt) : 1.f;
+        g_cineHdg = Wrap180(g_cineHdg + Wrap180(XPLMGetDataf(dr_psi) - g_cineHdg) * b);
+        V3 off = s.eye ? V3{0, XPLMGetDataf(dr_peY), XPLMGetDataf(dr_peZ)}
+                       : V3{s.px * S * g_cineSide, s.py * R, s.pz * L};
+        V3 pivot = acf + Orient(off, XPLMGetDataf(dr_psi), XPLMGetDataf(dr_the), XPLMGetDataf(dr_phi));
+        double yaw = g_cineSide * (s.yaw0 + (s.yaw1 - s.yaw0) * k);
+        double pitch = s.pitch0 + (s.pitch1 - s.pitch0) * k;
+        if (g_cineGround) pitch = fmin(pitch, -3.0);   // keep low shots out of the grass
+        double dist = fmax(6.0,(s.dist0 + (s.dist1 - s.dist0) * k) * R * Clamp(g_cfg.cinematic_distance, 0.3f, 5.f));
+        pos = pivot - Orient({0, 0, -1}, g_cineHdg + yaw, pitch, 0) * dist;
+        look = pivot;
+        shakeYaw = g_fxExtYaw;
+        shakePitch = g_fxExtPitch;
+    }
+
+    XPLMProbeInfo_t info = {sizeof(info)};
+    if (XPLMProbeTerrainXYZ(g_probe, (float)pos.x, (float)pos.y, (float)pos.z, &info) == xplm_ProbeHitTerrain &&
+        pos.y < info.locationY + 1.5)
+        pos.y = info.locationY + 1.5;
+
+    V3 d = look - pos;
+    out->x = (float)pos.x;
+    out->y = (float)pos.y;
+    out->z = (float)pos.z;
+    out->heading = (float)(atan2(d.x, -d.z) * R2D) + shakeYaw;
+    out->pitch = (float)(atan2(d.y, sqrt(d.x * d.x + d.z * d.z)) * R2D) + shakePitch;
+    out->roll = 0.f;
+    out->zoom = zoom;
+}
+
+// Black dip between cinematic shots, drawn under X-Plane's own windows.
+static int FadeDrawCB(XPLMDrawingPhase, int, void*) {
+    if (!g_cine || g_fade <= 0.001f) return 1;
+    XPLMSetGraphicsState(0, 0, 0, 0, 1, 0, 0);
+    glColor4f(0.f, 0.f, 0.f, g_fade);
+    glBegin(GL_QUADS);   // oversized: 2D coordinates may be pixels or UI units
+    glVertex2f(-20000.f, -20000.f);
+    glVertex2f(20000.f, -20000.f);
+    glVertex2f(20000.f, 20000.f);
+    glVertex2f(-20000.f, 20000.f);
+    glEnd();
+    return 1;
+}
+
 static int CameraCB(XPLMCameraPosition_t* out, int losingControl, void*) {
     if (losingControl || !out) {
+        StopCinematic(false);
         g_inControl = false;
         ClearHeldInput();
         Log("lost camera control");
@@ -724,6 +1150,11 @@ static int CameraCB(XPLMCameraPosition_t* out, int losingControl, void*) {
     double now = Now();
     float dt = (float)fmin(now - last, 0.1);
     last = now;
+
+    if (g_cine) {
+        CinematicCamera(out, dt);
+        return 1;
+    }
 
     ProcessInput(dt);
     Smooth(dt);
@@ -745,10 +1176,11 @@ static int CameraCB(XPLMCameraPosition_t* out, int losingControl, void*) {
     out->x = (float)pos.x;
     out->y = (float)pos.y;
     out->z = (float)pos.z;
-    out->heading = (float)h + g_fxExtYaw;
-    out->pitch = (float)p + g_fxExtPitch;
+    out->heading = (float)h + g_fxExtYaw + g_binoYawCur;
+    out->pitch = Clamp((float)p + g_fxExtPitch + g_binoPitchCur, -89.f, 89.f);
     out->roll = 0.f;
-    out->zoom = 1.f;
+    out->zoom = g_binoZoomCur;
+    g_viewHdg = out->heading;
     return 1;
 }
 
@@ -766,6 +1198,8 @@ static void UpdateCockpit(float dt) {
     XPLMSetDataf(dr_headZ, g_cur.z + (float)g_fxHead.z);
     XPLMSetDataf(dr_headPsi, g_cur.yaw + g_fxYaw);
     XPLMSetDataf(dr_headThe, g_cur.pitch + g_fxPitch);
+    ApplyCockpitFov();
+    g_viewHdg = XPLMGetDataf(dr_psi) + g_cur.yaw + g_fxYaw;
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +1210,7 @@ static HWND g_hwnd = nullptr;
 static WNDPROC g_origProc = nullptr;
 
 static bool Active() { return g_running; }
+static bool g_mEaten = false;        // swallow the middle-button release of a binocular toggle
 
 static LRESULT CALLBACK MainWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
@@ -804,9 +1239,31 @@ static LRESULT CALLBACK MainWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         }
         break;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONDBLCLK:
+        // Middle click while right-dragging raises / lowers the binoculars.
+        if (g_rDrag && Active() && !g_cine) {
+            g_binoToggleReq = true;
+            g_mEaten = true;
+            return 0;
+        }
+        break;
+    case WM_MBUTTONUP:
+        if (g_mEaten) { g_mEaten = false; return 0; }
+        break;
     case WM_MOUSEWHEEL:
-        // In the cockpit X-Plane's own wheel zoom (which leaves knobs alone)
-        // applies, so only exterior views use the wheel here.
+        // Binoculars take the wheel for their own magnification, everywhere.
+        if (Active() && g_bino) {
+            g_wheel += GET_WHEEL_DELTA_WPARAM(w) / (double)WHEEL_DELTA;
+            return 0;
+        }
+        // Right-drag + wheel in the cockpit is OrbitView's own zoom.
+        if (Active() && g_rDrag && g_mode == COCKPIT && !g_cine) {
+            g_wheel += GET_WHEEL_DELTA_WPARAM(w) / (double)WHEEL_DELTA;
+            return 0;
+        }
+        // Otherwise in the cockpit X-Plane's own wheel zoom (which leaves
+        // knobs alone) applies, so only exterior views use the wheel here.
         if (Active() && g_mode == EXTERIOR) {
             g_wheel += GET_WHEEL_DELTA_WPARAM(w) / (double)WHEEL_DELTA;
             if (g_rDrag) return 0;
@@ -892,9 +1349,19 @@ static int KeySniffer(char, XPLMKeyFlags flags, char vkey, void*) {
         }
         return 0;
     }
+    if (mods == 0 && vk == XPLM_VK_F12) {
+        if (down) {
+            if (g_cine) StopCinematic(true);
+            else StartCinematic();
+        }
+        return 0;
+    }
     if (mods == 0 && (vk == XPLM_VK_A || vk == XPLM_VK_D || vk == XPLM_VK_END)) {
         if (down) {
-            if (vk == XPLM_VK_END) SetMode(g_mode == COCKPIT ? EXTERIOR : COCKPIT);
+            if (g_cine) {   // in cinematic: A / D skip a shot, End leaves
+                if (vk == XPLM_VK_END) StopCinematic(true);
+                else StartShot(true);
+            } else if (vk == XPLM_VK_END) SetMode(g_mode == COCKPIT ? EXTERIOR : COCKPIT);
             else StepView(vk == XPLM_VK_D ? 1 : -1);
         }
         return 0;
@@ -1014,6 +1481,7 @@ static int ViewWindowCB(XPWidgetMessage msg, XPWidgetID, intptr_t p1, intptr_t p
         return 1;
     }
     if (!g_viewsReady) return 1;
+    StopCinematic(false);
     char name[32];
     NameFieldText(name, sizeof(name));
     if (btn == g_switchBtn) SetMode(g_mode == COCKPIT ? EXTERIOR : COCKPIT);
@@ -1136,7 +1604,7 @@ enum {
     CMD_NEXT, CMD_PREV, CMD_TOGGLE_INOUT,
     CMD_MOVE_FWD, CMD_MOVE_BACK, CMD_MOVE_LEFT, CMD_MOVE_RIGHT, CMD_MOVE_UP, CMD_MOVE_DOWN,
     CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_RESET, CMD_ADD, CMD_SAVE, CMD_DELETE,
-    CMD_WINDOW, CMD_TOGGLE_ENABLED, CMD_COUNT
+    CMD_WINDOW, CMD_TOGGLE_ENABLED, CMD_CINEMATIC, CMD_FLYBY, CMD_BINOCULARS, CMD_COUNT
 };
 static const char* kCmds[CMD_COUNT][2] = {
     {"orbitview/next_view", "OrbitView: next view"},
@@ -1156,6 +1624,9 @@ static const char* kCmds[CMD_COUNT][2] = {
     {"orbitview/delete_view", "OrbitView: delete the selected view"},
     {"orbitview/toggle_window", "OrbitView: show / hide the views window"},
     {"orbitview/toggle", "OrbitView: enable / disable"},
+    {"orbitview/cinematic", "OrbitView: cinematic camera on / off"},
+    {"orbitview/cinematic_flyby", "OrbitView: cinematic flyby now"},
+    {"orbitview/binoculars", "OrbitView: raise / lower binoculars"},
 };
 static XPLMCommandRef g_cmdRefs[CMD_COUNT];
 
@@ -1184,6 +1655,26 @@ static int CommandCB(XPLMCommandRef, XPLMCommandPhase phase, void* ref) {
     if (id == CMD_TOGGLE_ENABLED) { SetEnabled(!g_enabled); return 0; }
     if (id == CMD_WINDOW) { ToggleViewWindow(); return 0; }
     if (!Active()) return 0;
+    if (id == CMD_BINOCULARS) {
+        if (!g_cine) ToggleBinoculars();
+        return 0;
+    }
+    if (id == CMD_CINEMATIC) {
+        if (g_cine) StopCinematic(true); else StartCinematic();
+        return 0;
+    }
+    if (id == CMD_FLYBY) {
+        if (!FlybyPossible()) { ShowToastText("Flyby needs the aircraft moving"); return 0; }
+        StartCinematic();
+        g_cineT = 0;
+        StartFlyby();
+        return 0;
+    }
+    if (g_cine) {
+        if (id == CMD_NEXT || id == CMD_PREV) { StartShot(true); return 0; }
+        StopCinematic(id == CMD_TOGGLE_INOUT);
+        if (id == CMD_TOGGLE_INOUT) return 0;
+    }
     switch (id) {
     case CMD_NEXT: StepView(1); break;
     case CMD_PREV: StepView(-1); break;
@@ -1225,6 +1716,7 @@ static void MenuCB(void*, void* item) {
     case MENU_FACTORY: if (g_viewsReady) RestoreFactoryViews(); break;
     case MENU_RELOAD:
         LoadConfig();
+        g_binoZoom = 0.f;            // next raise starts at the new binocular_zoom
         g_stickX = g_stickY = -1;
         RefreshPrefsPage();
         Log("config reloaded");
@@ -1259,6 +1751,7 @@ static float FlightLoop(float, float, int, void*) {
 
     static double nextSlow = 0;
     if (now >= nextSlow) {
+        if (nextSlow == 0) RecoverFovAfterRestart();   // first loop: prefs are loaded by now
         nextSlow = now + 1.0;
         HookMainWindow();
         int sx = g_stickX, sy = g_stickY;
@@ -1288,8 +1781,15 @@ static float FlightLoop(float, float, int, void*) {
     if (!g_enabled || vr || !g_viewsReady) {
         if (g_running) StopRunning();
         ResetEffects();
+        g_binoToggleReq = false;
+        ShowCompass(false);
         return -1;
     }
+    if (g_binoToggleReq) {
+        g_binoToggleReq = false;
+        if (g_running && !g_cine) ToggleBinoculars();
+    }
+    ShowCompass(g_running && g_bino);
 
     if (!g_running) {
         g_running = true;
@@ -1302,7 +1802,10 @@ static float FlightLoop(float, float, int, void*) {
     // Follow view changes made through X-Plane's own view keys/menus.
     if (now - g_lastViewCmdTime > 1.0) {
         int m = XPLMGetDatai(dr_isExternal) ? EXTERIOR : COCKPIT;
-        if (m != g_mode) EnterMode(m);
+        if (m != g_mode) {
+            StopCinematic(false);
+            EnterMode(m);
+        }
     }
 
     // Re-take the camera if another plugin let go of it.
@@ -1363,6 +1866,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     dr_gs = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
     dr_onGround = XPLMFindDataRef("sim/flightmodel/failures/onground_any");
     dr_paused = XPLMFindDataRef("sim/time/paused");
+    dr_vx = XPLMFindDataRef("sim/flightmodel/position/local_vx");
+    dr_vz = XPLMFindDataRef("sim/flightmodel/position/local_vz");
+    dr_fov = XPLMFindDataRef("sim/graphics/view/field_of_view_deg");
+    dr_magPsi = XPLMFindDataRef("sim/flightmodel/position/mag_psi");
 
     g_probe = XPLMCreateProbe(xplm_ProbeY);
 
@@ -1395,6 +1902,9 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     wc.decorateAsFloatingWindow = xplm_WindowDecorationNone;
     wc.layer = xplm_WindowLayerFloatingWindows;
     g_toast = XPLMCreateWindowEx(&wc);
+    wc.drawWindowFunc = DrawCompass;
+    wc.layer = xplm_WindowLayerFlightOverlay;
+    g_compass = XPLMCreateWindowEx(&wc);
 
     return 1;
 }
@@ -1407,6 +1917,7 @@ PLUGIN_API void XPluginStop(void) {
     if (g_prefsDirtyAt >= 0) SavePrefs();
     if (g_win) XPDestroyWidget(g_win, 1);
     if (g_toast) XPLMDestroyWindow(g_toast);
+    if (g_compass) XPLMDestroyWindow(g_compass);
     if (g_menu) XPLMDestroyMenu(g_menu);
     if (g_probe) XPLMDestroyProbe(g_probe);
 }
@@ -1414,13 +1925,19 @@ PLUGIN_API void XPluginStop(void) {
 PLUGIN_API int XPluginEnable(void) {
     XPLMRegisterFlightLoopCallback(FlightLoop, -1, nullptr);
     XPLMRegisterKeySniffer(KeySniffer, 0, nullptr);
+    XPLMRegisterDrawCallback(FadeDrawCB, xplm_Phase_Window, 1, nullptr);
     g_initAt = Now() + 1.0;
     return 1;
 }
 
 PLUGIN_API void XPluginDisable(void) {
+    // Put the field of view back but keep fov_restore.txt: X-Plane may already
+    // have saved the changed value, so the next start restores it again.
+    if (g_savedFov >= 0.f && dr_fov) XPLMSetDataf(dr_fov, g_savedFov);
+    g_savedFov = -1.f;
     XPLMUnregisterFlightLoopCallback(FlightLoop, nullptr);
     XPLMUnregisterKeySniffer(KeySniffer, 0, nullptr);
+    XPLMUnregisterDrawCallback(FadeDrawCB, xplm_Phase_Window, 1, nullptr);
     StopRunning();
     g_viewsReady = false;
     UnhookMainWindow();

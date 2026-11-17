@@ -17,7 +17,7 @@ cl /nologo /O2 /EHsc /MT /std:c++17 /W3 /LD ^
    /DIBM=1 /DXPLM200 /DXPLM210 /DXPLM300 /DXPLM301 /DXPLM303 /DXPLM400 ^
    /I SDK\CHeaders\XPLM /I SDK\CHeaders\Widgets ^
    src\OrbitView.cpp /Fobuild\obj\ /Fe:build\OrbitView\64\win.xpl ^
-   /link SDK\Libraries\Win\XPLM_64.lib SDK\Libraries\Win\XPWidgets_64.lib user32.lib ^
+   /link SDK\Libraries\Win\XPLM_64.lib SDK\Libraries\Win\XPWidgets_64.lib user32.lib opengl32.lib ^
    /IMPLIB:build\obj\win.lib || exit /b 1
 
 copy /y config.ini build\OrbitView\ >nul

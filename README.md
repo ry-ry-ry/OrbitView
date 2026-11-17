@@ -5,6 +5,8 @@ A preset-based camera for **X-Plane 12** on Windows, in the style of ChasePlane.
 - **Views per aircraft.** Factory cockpit and exterior views are built from each aircraft's eye point and size. Add, rename, delete and save your own.
 - **Smooth everywhere.** Glides between views, with eased mouse, keyboard and stick input.
 - **Full precision in the cockpit.** Cockpit views drive the pilot's head, so the panel doesn't shimmer when you're far from X-Plane's local origin.
+- **Cinematic camera.** Press `F12` for a hands-off show: slow drifting shots of the nose, flight deck, engines, wings, tail and belly, about 7 seconds each with a dip to black between them, and now and then a flyby where the camera waits beside the flight path and the aircraft roars past.
+- **Binoculars.** Hold the right button and click the middle one to magnify whatever you're looking at, up to 50x, with a heading tape so you know where it is.
 - **Camera effects (optional).** G-force head sway, turbulence jolts, runway rumble and a touchdown bump scaled by your sink rate.
 - **Scales with X-Plane's UI** and stays usable on 4K screens.
 
@@ -23,11 +25,14 @@ A preset-based camera for **X-Plane 12** on Windows, in the style of ChasePlane.
 | Right-drag | Look around (cockpit) / orbit (exterior) |
 | Gamepad right stick | Look around / orbit (uses the axes set to *View left/right* and *View up/down*) |
 | Mouse wheel, `=` / `-` | Zoom. In the cockpit this is X-Plane's own zoom, so pointing at a knob still turns it |
+| Right-drag + wheel (cockpit) | OrbitView's own cockpit zoom: finer steps, from 0.4x (much wider than X-Plane's zoom-out) to 3x. It's kept per view, so **Save to selected** remembers it |
 | `Shift+W` / `S` | Move forward / back (exterior: closer / farther) |
 | `Shift+A` / `D` | Move left / right |
 | `Shift+E` / `Q` | Move up / down |
 | `Shift+Space` | Reset the current view |
 | `Ctrl+Shift+Space` | Add the current camera as a new view |
+| Hold right button + middle click | Raise / lower binoculars. The wheel sets their magnification (2x to 50x, separate from the normal zoom), right-drag looks around, and a compass along the bottom shows the magnetic heading you're looking at |
+| `F12` | Cinematic camera on / off. While it runs, `A` / `D` skip to another shot and `End` also leaves it |
 
 Every action is also an `orbitview/*` command, so you can bind it to anything in X-Plane's keyboard or joystick settings. If any of these keys are already in use in your keymap, rebind them there, or set `keyboard = 0` in `config.ini` and use the commands instead.
 
